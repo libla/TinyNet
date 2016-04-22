@@ -7,7 +7,7 @@ using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
-namespace Network
+namespace TinyNet
 {
 	// 发送和接收缓冲区
 	public class ByteBuffer
@@ -117,6 +117,7 @@ namespace Network
 		void Write(byte[] bytes);
 		void Write(byte[] bytes, int length);
 		void Write(byte[] bytes, int offset, int length);
+		void Write(IntPtr bytes, int length);
 		void Destroy();
 		NetListener Listen { get; set; }
 		bool IsConnected { get; }
@@ -561,12 +562,14 @@ namespace Network
 			public readonly ByteBuffer read_buffer_tmp = new ByteBuffer();
 			public NetListener listen = null;
 
-			public NetHandlerImpl() : base(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+			public NetHandlerImpl()
+				: base(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
 			{
 				SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
 
-			public NetHandlerImpl(Socket socket) : base(socket.DuplicateAndClose(Process.GetCurrentProcess().Id))
+			public NetHandlerImpl(Socket socket)
+				: base(socket.DuplicateAndClose(Process.GetCurrentProcess().Id))
 			{
 				SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
@@ -595,6 +598,15 @@ namespace Network
 				{
 					need_send = true;
 					write_buffer.Write(bytes, offset, length);
+				}
+			}
+
+			public void Write(IntPtr bytes, int length)
+			{
+				lock (write_buffer)
+				{
+					need_send = true;
+					write_buffer.Write(bytes, length);
 				}
 			}
 
