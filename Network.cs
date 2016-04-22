@@ -185,143 +185,135 @@ namespace Network
 
 				byte[] bytes = new byte[64 * 1024];
 
-				try
+				while (true)
 				{
-					while (true)
+					if (newsockets.Count > 0)
 					{
-						if (newsockets.Count > 0)
+						lock (newsockets)
 						{
-							lock (newsockets)
-							{
-								sockets.AddRange(newsockets);
-								newsockets.Clear();
-							}
+							sockets.AddRange(newsockets);
+							newsockets.Clear();
 						}
-						if (deletesockets.Count > 0)
+					}
+					if (deletesockets.Count > 0)
+					{
+						lock (deletesockets)
 						{
-							lock (deletesockets)
+							for (int i = 0; i < deletesockets.Count; i++)
 							{
-								for (int i = 0; i < deletesockets.Count; i++)
+								NetHandlerImpl socket = deletesockets[i];
+								sockets.Remove(socket);
+								socket.Close();
+								orders.Add(new UpdateOrder { socket = socket, type = OrderType.Close });
+							}
+							deletesockets.Clear();
+						}
+					}
+					if (orders.Count > 0)
+					{
+						lock (updates)
+						{
+							updates.AddRange(orders);
+						}
+						orders.Clear();
+					}
+					if (sockets.Count == 0)
+					{
+						Thread.Sleep(0);
+						continue;
+					}
+					for (int i = 0; i < sockets.Count; i++)
+					{
+						NetHandlerImpl socket = sockets[i];
+						reads.Add(socket);
+						errors.Add(socket);
+						if (socket.need_send)
+							writers.Add(socket);
+					}
+					Socket.Select(reads, writers, errors, -1);
+					for (int i = 0; i < writers.Count; i++)
+					{
+						NetHandlerImpl socket = writers[i];
+						ByteBuffer buffer = socket.write_buffer;
+						lock (buffer)
+						{
+							int length = socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
+							buffer.Pop(length);
+							socket.need_send = buffer.length != 0;
+						}
+					}
+					for (int i = 0; i < reads.Count; i++)
+					{
+						NetHandlerImpl socket = reads[i];
+						ByteBuffer buffer = socket.read_buffer_tmp;
+						try
+						{
+							int total = 0;
+							while (reads[i].Available > 0)
+							{
+								int length = reads[i].Receive(bytes);
+								if (length == 0)
 								{
-									NetHandlerImpl socket = deletesockets[i];
-									sockets.Remove(socket);
-									socket.Close();
-									orders.Add(new UpdateOrder { socket = socket, type = OrderType.Close });
+									break;
 								}
-								deletesockets.Clear();
+								total += length;
+								buffer.Write(bytes, length);
 							}
-						}
-						if (orders.Count > 0)
-						{
-							lock (updates)
+							if (total > 0)
 							{
-								updates.AddRange(orders);
+								news.Add(socket);
 							}
-							orders.Clear();
-						}
-						if (sockets.Count == 0)
-						{
-							Thread.Sleep(0);
-							continue;
-						}
-						for (int i = 0; i < sockets.Count; i++)
-						{
-							NetHandlerImpl socket = sockets[i];
-							reads.Add(socket);
-							errors.Add(socket);
-							if (socket.need_send)
-								writers.Add(socket);
-						}
-						Socket.Select(reads, writers, errors, -1);
-						for (int i = 0; i < writers.Count; i++)
-						{
-							NetHandlerImpl socket = writers[i];
-							ByteBuffer buffer = socket.write_buffer;
-							lock (buffer)
+							else
 							{
-								int length = socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
-								buffer.Pop(length);
-								socket.need_send = buffer.length != 0;
-							}
-						}
-						for (int i = 0; i < reads.Count; i++)
-						{
-							NetHandlerImpl socket = reads[i];
-							ByteBuffer buffer = socket.read_buffer_tmp;
-							try
-							{
-								int total = 0;
-								while (reads[i].Available > 0)
+								lock (deletesockets)
 								{
-									int length = reads[i].Receive(bytes);
-									if (length == 0)
-									{
-										break;
-									}
-									total += length;
-									buffer.Write(bytes, length);
-								}
-								if (total > 0)
-								{
-									news.Add(socket);
-								}
-								else
-								{
-									lock (deletesockets)
-									{
-										deletesockets.Add(socket);
-									}
+									deletesockets.Add(socket);
 								}
 							}
-							catch (SocketException e)
+						}
+						catch (SocketException e)
+						{
+							if (e.SocketErrorCode == SocketError.ConnectionReset ||
+								e.SocketErrorCode == SocketError.ConnectionAborted ||
+								e.SocketErrorCode == SocketError.NotConnected ||
+								e.SocketErrorCode == SocketError.Shutdown)
 							{
-								if (e.SocketErrorCode == SocketError.ConnectionReset ||
-									e.SocketErrorCode == SocketError.ConnectionAborted ||
-									e.SocketErrorCode == SocketError.NotConnected ||
-									e.SocketErrorCode == SocketError.Shutdown)
+								lock (deletesockets)
 								{
-									lock (deletesockets)
-									{
-										deletesockets.Add(socket);
-									}
-								}
-								else
-								{
-									orders.Add(new UpdateOrder { socket = socket, type = OrderType.Error, param = e });
+									deletesockets.Add(socket);
 								}
 							}
-							catch (Exception e)
+							else
 							{
 								orders.Add(new UpdateOrder { socket = socket, type = OrderType.Error, param = e });
 							}
 						}
-						if (news.Count > 0)
+						catch (Exception e)
 						{
-							lock (updates)
+							orders.Add(new UpdateOrder { socket = socket, type = OrderType.Error, param = e });
+						}
+					}
+					if (news.Count > 0)
+					{
+						lock (updates)
+						{
+							for (int i = 0; i < news.Count; i++)
 							{
-								for (int i = 0; i < news.Count; i++)
+								NetHandlerImpl socket = news[i];
+								socket.read_buffer.Write(socket.read_buffer_tmp.array, socket.read_buffer_tmp.offset, socket.read_buffer_tmp.length);
+								socket.read_buffer_tmp.Reset();
+								if (!receives.ContainsKey(socket))
 								{
-									NetHandlerImpl socket = news[i];
-									socket.read_buffer.Write(socket.read_buffer_tmp.array, socket.read_buffer_tmp.offset, socket.read_buffer_tmp.length);
-									socket.read_buffer_tmp.Reset();
-									if (!receives.ContainsKey(socket))
-									{
-										receives.Add(socket, updates.Count);
-										updates.Add(new UpdateOrder { socket = socket, type = OrderType.Receive });
-									}
+									receives.Add(socket, updates.Count);
+									updates.Add(new UpdateOrder { socket = socket, type = OrderType.Receive });
 								}
 							}
-							news.Clear();
 						}
-						reads.Clear();
-						writers.Clear();
-						errors.Clear();
+						news.Clear();
 					}
-				}
-				catch (Exception e)
-				{
-					
-					throw;
+					reads.Clear();
+					writers.Clear();
+					errors.Clear();
 				}
 			}).Start();
 		}
