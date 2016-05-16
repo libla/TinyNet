@@ -127,6 +127,7 @@ namespace TinyNet
 	public class NetManager
 	{
 		private bool inited = false;
+		private bool running = true;
 		private readonly List<NetHandlerImpl> sockets = new List<NetHandlerImpl>();
 		private readonly List<NetHandlerImpl> newsockets = new List<NetHandlerImpl>();
 		private readonly List<NetHandlerImpl> deletesockets = new List<NetHandlerImpl>();
@@ -186,7 +187,7 @@ namespace TinyNet
 
 				byte[] bytes = new byte[64 * 1024];
 
-				while (true)
+				while (running)
 				{
 					if (newsockets.Count > 0)
 					{
@@ -231,7 +232,7 @@ namespace TinyNet
 						if (socket.need_send)
 							writers.Add(socket);
 					}
-					Socket.Select(reads, writers, errors, -1);
+					Socket.Select(reads, writers, errors, 5);
 					for (int i = 0; i < writers.Count; i++)
 					{
 						NetHandlerImpl socket = writers[i];
@@ -340,7 +341,7 @@ namespace TinyNet
 					}
 				}
 				ctrl.Callback = callback;
-				while (true)
+				while (running)
 				{
 					if (!server.Server.Poll(1000, SelectMode.SelectRead))
 					{
@@ -383,6 +384,11 @@ namespace TinyNet
 					listens.Remove(port);
 				}
 			}
+		}
+
+		public void Exit()
+		{
+			running = false;
 		}
 
 		public delegate void Connected(NetHandler handler, bool success);
@@ -610,7 +616,7 @@ namespace TinyNet
 				}
 			}
 
-			public NetListener Listen
+			public new NetListener Listen
 			{
 				get { return listen; }
 				set { listen = value; }
