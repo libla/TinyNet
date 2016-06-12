@@ -1,8 +1,9 @@
 ﻿using System;
+using UnityEngine;
 
 namespace TinyNet
 {
-	class TestCase
+	public class TestCase
 	{
 		private static NetManager mgr = null;
 		public static NetManager NetMgr
@@ -20,7 +21,7 @@ namespace TinyNet
 								UTF8StringRequest req = request as UTF8StringRequest;
 								if (req != null)
 								{
-									Console.WriteLine("{0}", req.Value);
+									Debug.Log(req.Value);
 								}
 							}
 						}
@@ -35,7 +36,7 @@ namespace TinyNet
 		{
 			NetMgr.Listen(port, delegate(NetHandler socket)
 			{
-				Console.WriteLine("New Connection");
+				Debug.Log("New Connection");
 			});
 		}
 
@@ -45,15 +46,22 @@ namespace TinyNet
 			{
 				if (exception == null)
 				{
-					Console.WriteLine("Connected");
+					Debug.Log("Connected");
 					UTF8StringRequest req = new UTF8StringRequest { Value = "Hello, world!" };
 					req.Send(handler);
 				}
 				else
 				{
-					Console.WriteLine("Connnect Fail! {0}", exception.ToString());
+					Debug.Log("Connnect Fail! " + exception.ToString());
 				}
 			});
+		}
+
+		public static void Main(string[] args)
+		{
+			NetManager.Initialize();
+			StartListen(12306);
+			StartConnect("localhost:12306");
 		}
 	}
 }
