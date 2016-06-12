@@ -1,47 +1,59 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Text;
 
 namespace TinyNet
 {
-	class Proc : NetListener
-	{
-		public void OnReceive(NetHandler handler, ByteBuffer buffer)
-		{
-			Console.WriteLine("{0}", Encoding.UTF8.GetString(buffer.array, buffer.offset, buffer.length));
-			buffer.Reset();
-		}
-
-		public void OnError(NetHandler handler, Exception error)
-		{
-
-		}
-
-		public void OnClose(NetHandler handler)
-		{
-
-		}
-	}
-
 	class TestCase
 	{
 		private static NetManager mgr = null;
+		public static NetManager NetMgr
+		{
+			get
+			{
+				if (mgr == null)
+				{
+					Settings settings = new Settings
+					{
+						events =
+						{
+							request = (handler, request) =>
+							{
+								UTF8StringRequest req = request as UTF8StringRequest;
+								if (req != null)
+								{
+									Console.WriteLine("{0}", req.Value);
+								}
+							}
+						}
+					};
+					mgr = new NetManager<UTF8StringRequest>(settings);
+				}
+				return mgr;
+			}
+		}
+
 		public static void StartListen(int port)
 		{
-			if (mgr == null)
-				mgr = new NetManager();
-			mgr.Listen(port, delegate(NetHandler socket)
+			NetMgr.Listen(port, delegate(NetHandler socket)
 			{
-				socket.Listen = new Proc();
+				Console.WriteLine("New Connection");
 			});
 		}
 
 		public static void StartConnect(string ipport)
 		{
-			if (mgr == null)
-				mgr = new NetManager();
-			NetHandler socket = mgr.Connect(ipport, 3000);
-			socket.Listen = new Proc();
+			NetMgr.Connect(ipport, 3000, (handler, exception) =>
+			{
+				if (exception == null)
+				{
+					Console.WriteLine("Connected");
+					UTF8StringRequest req = new UTF8StringRequest { Value = "Hello, world!" };
+					req.Send(handler);
+				}
+				else
+				{
+					Console.WriteLine("Connnect Fail! {0}", exception.ToString());
+				}
+			});
 		}
 	}
 }

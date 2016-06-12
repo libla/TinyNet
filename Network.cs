@@ -6,10 +6,70 @@ using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using UnityEngine;
+using UnityObject = UnityEngine.Object;
 
 namespace TinyNet
 {
-	// 发送和接收缓冲区
+	#region 发送和接收缓冲区
+	/// <summary>
+	/// 填充数据包
+	/// </summary>
+	public struct BufferSegment
+	{
+		public byte[] Array;
+		public int Length;
+		public int Offset;
+		public IntPtr IntPtr;
+		public byte Byte;
+
+		public static BufferSegment Make(byte[] array)
+		{
+			return Make(array, 0, array.Length);
+		}
+
+		public static BufferSegment Make(byte[] array, int length)
+		{
+			return Make(array, 0, length);
+		}
+
+		public static BufferSegment Make(byte[] array, int offset, int length)
+		{
+			BufferSegment seg = new BufferSegment
+			{
+				Array = array,
+				Length = length,
+				Offset = offset,
+			};
+			return seg;
+		}
+
+		public static BufferSegment Make(IntPtr intptr, int length)
+		{
+			BufferSegment seg = new BufferSegment
+			{
+				Array = null,
+				IntPtr = intptr,
+				Length = length,
+			};
+			return seg;
+		}
+
+		public static BufferSegment Make(byte onebyte)
+		{
+			BufferSegment seg = new BufferSegment
+			{
+				Array = null,
+				IntPtr = IntPtr.Zero,
+				Byte = onebyte,
+			};
+			return seg;
+		}
+	}
+
+	/// <summary>
+	/// 复用缓冲区
+	/// </summary>
 	public class ByteBuffer
 	{
 		private byte[] _array;
@@ -35,14 +95,38 @@ namespace TinyNet
 			_offset = 0;
 		}
 
-		public void Write(byte[] bytes)
+		private static readonly Stack<ByteBuffer> freelist = new Stack<ByteBuffer>();
+
+		public static ByteBuffer New()
 		{
-			Write(bytes, 0, bytes.Length);
+			if (freelist.Count > 0)
+			{
+				lock (freelist)
+				{
+					if (freelist.Count > 0)
+						return freelist.Pop();
+				}
+			}
+			return new ByteBuffer();
 		}
 
-		public void Write(byte[] bytes, int length)
+		public void Release()
 		{
-			Write(bytes, 0, length);
+			Reset();
+			lock (freelist)
+			{
+				freelist.Push(this);
+			}
+		}
+
+		public void Write(BufferSegment seg)
+		{
+			if (seg.Array != null)
+				Write(seg.Array, seg.Offset, seg.Length);
+			else if (seg.IntPtr != IntPtr.Zero)
+				Write(seg.IntPtr, seg.Length);
+			else
+				Write(seg.Byte);
 		}
 
 		private void checksize(int length)
@@ -84,6 +168,13 @@ namespace TinyNet
 			_length += length;
 		}
 
+		public void Write(byte onebyte)
+		{
+			checksize(1);
+			_array[_offset + _length] = onebyte;
+			_length += 1;
+		}
+
 		public void Pop(int length)
 		{
 			if (length > _length)
@@ -102,229 +193,194 @@ namespace TinyNet
 			_length = 0;
 		}
 	}
+	#endregion
 
-	// 处理网络消息接收
-	public interface NetListener
+	#region 解析网络请求
+	/// <summary>
+	/// 基础请求类
+	/// </summary>
+	public abstract class Request
 	{
-		void OnReceive(NetHandler handler, ByteBuffer buffer);
-		void OnError(NetHandler handler, Exception error);
-		void OnClose(NetHandler handler);
+		private readonly ByteBuffer buffer;
+
+		protected Request()
+		{
+			buffer = ByteBuffer.New();
+		}
+
+		~Request()
+		{
+			buffer.Release();
+		}
+
+		internal bool Input(byte[] bytes, int offset, ref int length)
+		{
+			int len = length;
+			while (len > 0)
+			{
+				int l = PreTest(buffer, bytes, offset, length);
+				offset += l;
+				len -= l;
+				if (Test(buffer))
+				{
+					length -= len;
+					return true;
+				}
+			}
+			return false;
+		}
+
+		protected abstract int PreTest(ByteBuffer buffer, byte[] bytes, int offset, int length);
+		protected abstract bool Test(ByteBuffer buffer);
+		internal abstract void Execute(NetHandler handler);
+		public abstract bool Send(NetHandler handler);
+
+		public virtual void Reset()
+		{
+			buffer.Reset();
+		}
 	}
 
-	// Socket抽象句柄
-	public interface NetHandler
+	/// <summary>
+	/// 无ID分组
+	/// </summary>
+	public abstract class Request<T> : Request
 	{
-		void Write(byte[] bytes);
-		void Write(byte[] bytes, int length);
-		void Write(byte[] bytes, int offset, int length);
-		void Write(IntPtr bytes, int length);
-		void Destroy();
-		NetListener Listen { get; set; }
-		bool IsConnected { get; }
+		public T Value;
+		internal override void Execute(NetHandler handler)
+		{
+			Handle(handler, Value);
+		}
+
+		protected virtual void Handle(NetHandler handler, T t)
+		{
+			if (DefaultHandler != null)
+				DefaultHandler(handler, t);
+		}
+
+		public static event Action<NetHandler, T> DefaultHandler;
 	}
 
-	// 全局接口
-	public class NetManager
+	/// <summary>
+	/// 按ID分组
+	/// </summary>
+	public abstract class Request<TKey, T> : Request
 	{
+		public TKey ID;
+		public T Value;
+		internal override void Execute(NetHandler handler)
+		{
+			Handle(handler, ID, Value);
+		}
+
+		protected virtual void Handle(NetHandler handler, TKey k, T t)
+		{
+			Action<NetHandler, T> action;
+			if (_Handlers.TryGetValue(k, out action))
+			{
+				action(handler, t);
+			}
+			else
+			{
+				if (DefaultHandler != null)
+					DefaultHandler(handler, k, t);
+			}
+		}
+
+		private static readonly Dictionary<TKey, Action<NetHandler, T>> _Handlers = new Dictionary<TKey, Action<NetHandler, T>>();
+		public static Dictionary<TKey, Action<NetHandler, T>> Handlers
+		{
+			get
+			{
+				return _Handlers;
+			}
+		}
+		public static event Action<NetHandler, TKey, T> DefaultHandler;
+	}
+	#endregion
+
+	#region 设置相关
+	public class Settings
+	{
+		public uint timeout;
+		public int sendbytes;
+		public Events events;
+
+		public struct Events
+		{
+			public Action<NetHandler, Request> request;
+			public Action<NetHandler, int> read;
+			public Action<NetHandler, int> write;
+			public Action<NetHandler> close;
+			public Action<NetHandler, Exception> exception;
+		}
+
+		public Settings()
+		{
+			timeout = 5;
+			sendbytes = 2 << 24;
+		}
+	}
+	#endregion
+
+	/// <summary>
+	/// 网络连接抽象句柄
+	/// </summary>
+	public abstract class NetHandler
+	{
+		public abstract bool Send(BufferSegment seg);
+		public abstract bool Send(BufferSegment seg1, BufferSegment seg2);
+		public abstract bool Send(BufferSegment seg1, BufferSegment seg2, BufferSegment seg3);
+		public abstract bool Send(BufferSegment seg, params BufferSegment[] segs);
+		public abstract void Close();
+		public abstract bool Connected { get; }
+		public abstract IPEndPoint Remote { get; }
+		public abstract IPEndPoint Local { get; }
+		public abstract short TTL { get; set; }
+		public abstract bool NoDelay { get; set; }
+	}
+
+	/// <summary>
+	/// 网络管理全局接口
+	/// </summary>
+	public abstract class NetManager : IDisposable
+	{
+		protected readonly Settings settings = null;
+		private static bool IsRunning = true;
+
 		private bool inited = false;
-		private bool running = true;
+		private bool valid = true;
 		private readonly List<NetHandlerImpl> sockets = new List<NetHandlerImpl>();
 		private readonly List<NetHandlerImpl> newsockets = new List<NetHandlerImpl>();
 		private readonly List<NetHandlerImpl> deletesockets = new List<NetHandlerImpl>();
 		private readonly Dictionary<int, Control> listens = new Dictionary<int, Control>();
-		private readonly Dictionary<NetHandlerImpl, int> receives = new Dictionary<NetHandlerImpl, int>();
-		private readonly List<UpdateOrder> updates = new List<UpdateOrder>();
-		private readonly List<Connecting> connectings = new List<Connecting>();
-		private readonly List<Accepting> acceptings = new List<Accepting>();
 
-		public delegate void Accepted(NetHandler socket);
+		#region 内部使用的类
 		private class Control
 		{
-			public bool Running;
-			public Accepted Callback;
+			public bool running;
+			public Action<NetHandler> action;
+		}
+		#endregion
+
+		protected NetManager(Settings settings)
+		{
+			this.settings = settings;
 		}
 
-		private struct Accepting
+		public static void Initialize()
 		{
-			public NetHandler socket;
-			public Accepted callback;
+			Loop.Initialize();
 		}
 
-		enum OrderType
+		public void Listen(int port, Action<NetHandler> callback)
 		{
-			Receive,
-			Error,
-			Close,
-		}
-
-		private struct UpdateOrder
-		{
-			public NetHandlerImpl socket;
-			public OrderType type;
-			public object param;
-		}
-
-		private struct Connecting
-		{
-			public Connected callback;
-			public NetHandler socket;
-			public bool result;
-		}
-
-		private void Init()
-		{
-			if (inited)
-				return;
-
-			inited = true;
-			new Thread(delegate()
-			{
-				List<NetHandlerImpl> reads = new List<NetHandlerImpl>();
-				List<NetHandlerImpl> writers = new List<NetHandlerImpl>();
-				List<NetHandlerImpl> errors = new List<NetHandlerImpl>();
-				List<NetHandlerImpl> news = new List<NetHandlerImpl>();
-				List<UpdateOrder> orders = new List<UpdateOrder>();
-
-				byte[] bytes = new byte[64 * 1024];
-
-				while (running)
-				{
-					if (newsockets.Count > 0)
-					{
-						lock (newsockets)
-						{
-							sockets.AddRange(newsockets);
-							newsockets.Clear();
-						}
-					}
-					if (deletesockets.Count > 0)
-					{
-						lock (deletesockets)
-						{
-							for (int i = 0; i < deletesockets.Count; i++)
-							{
-								NetHandlerImpl socket = deletesockets[i];
-								sockets.Remove(socket);
-								socket.Close();
-								orders.Add(new UpdateOrder { socket = socket, type = OrderType.Close });
-							}
-							deletesockets.Clear();
-						}
-					}
-					if (orders.Count > 0)
-					{
-						lock (updates)
-						{
-							updates.AddRange(orders);
-						}
-						orders.Clear();
-					}
-					if (sockets.Count == 0)
-					{
-						Thread.Sleep(0);
-						continue;
-					}
-					for (int i = 0; i < sockets.Count; i++)
-					{
-						NetHandlerImpl socket = sockets[i];
-						reads.Add(socket);
-						errors.Add(socket);
-						if (socket.need_send)
-							writers.Add(socket);
-					}
-					Socket.Select(reads, writers, errors, 5);
-					for (int i = 0; i < writers.Count; i++)
-					{
-						NetHandlerImpl socket = writers[i];
-						ByteBuffer buffer = socket.write_buffer;
-						lock (buffer)
-						{
-							int length = socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
-							buffer.Pop(length);
-							socket.need_send = buffer.length != 0;
-						}
-					}
-					for (int i = 0; i < reads.Count; i++)
-					{
-						NetHandlerImpl socket = reads[i];
-						ByteBuffer buffer = socket.read_buffer_tmp;
-						try
-						{
-							int total = 0;
-							while (reads[i].Available > 0)
-							{
-								int length = reads[i].Receive(bytes);
-								if (length == 0)
-								{
-									break;
-								}
-								total += length;
-								buffer.Write(bytes, length);
-							}
-							if (total > 0)
-							{
-								news.Add(socket);
-							}
-							else
-							{
-								lock (deletesockets)
-								{
-									deletesockets.Add(socket);
-								}
-							}
-						}
-						catch (SocketException e)
-						{
-							if (e.SocketErrorCode == SocketError.ConnectionReset ||
-								e.SocketErrorCode == SocketError.ConnectionAborted ||
-								e.SocketErrorCode == SocketError.NotConnected ||
-								e.SocketErrorCode == SocketError.Shutdown)
-							{
-								lock (deletesockets)
-								{
-									deletesockets.Add(socket);
-								}
-							}
-							else
-							{
-								orders.Add(new UpdateOrder { socket = socket, type = OrderType.Error, param = e });
-							}
-						}
-						catch (Exception e)
-						{
-							orders.Add(new UpdateOrder { socket = socket, type = OrderType.Error, param = e });
-						}
-					}
-					if (news.Count > 0)
-					{
-						lock (updates)
-						{
-							for (int i = 0; i < news.Count; i++)
-							{
-								NetHandlerImpl socket = news[i];
-								socket.read_buffer.Write(socket.read_buffer_tmp.array, socket.read_buffer_tmp.offset, socket.read_buffer_tmp.length);
-								socket.read_buffer_tmp.Reset();
-								if (!receives.ContainsKey(socket))
-								{
-									receives.Add(socket, updates.Count);
-									updates.Add(new UpdateOrder { socket = socket, type = OrderType.Receive });
-								}
-							}
-						}
-						news.Clear();
-					}
-					reads.Clear();
-					writers.Clear();
-					errors.Clear();
-				}
-			}).Start();
-		}
-
-		public void Listen(int port, Accepted callback)
-		{
+			if (!valid)
+				throw new ObjectDisposedException(ToString());
 			Init();
 			new Thread(delegate()
 			{
+				Thread.CurrentThread.Name = "Network Server";
 				TcpListener server = new TcpListener(IPAddress.Any, port);
 				server.Start();
 				Control ctrl;
@@ -332,30 +388,31 @@ namespace TinyNet
 				{
 					if (listens.TryGetValue(port, out ctrl))
 					{
-						ctrl.Running = true;
+						ctrl.running = true;
 					}
 					else
 					{
-						ctrl = new Control { Running = true };
+						ctrl = new Control { running = true };
 						listens[port] = ctrl;
 					}
 				}
-				ctrl.Callback = callback;
-				while (running)
+				ctrl.action = callback;
+				while (valid && IsRunning)
 				{
 					if (!server.Server.Poll(1000, SelectMode.SelectRead))
 					{
-						if (!ctrl.Running)
+						if (!ctrl.running)
 							break;
 						continue;
 					}
 					if (!server.Pending())
 						break;
-					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket()) { Manager = this, Blocking = false };
-					lock (acceptings)
+					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket()) { Manager = this };
+					socket.Socket.Blocking = false;
+					Loop.Run(delegate()
 					{
-						acceptings.Add(new Accepting { socket = socket, callback = ctrl.Callback });
-					}
+						ctrl.action(socket);
+					});
 					lock (newsockets)
 					{
 						newsockets.Add(socket);
@@ -375,212 +432,378 @@ namespace TinyNet
 
 		public void Stop(int port)
 		{
+			if (!valid)
+				throw new ObjectDisposedException(ToString());
 			lock (listens)
 			{
 				Control ctrl;
 				if (listens.TryGetValue(port, out ctrl))
 				{
-					ctrl.Running = false;
+					ctrl.running = false;
 					listens.Remove(port);
 				}
 			}
 		}
 
-		public void Exit()
-		{
-			running = false;
-		}
-
-		public delegate void Connected(NetHandler handler, bool success);
-
-		public NetHandler Connect(string ipport, int timeout)
+		public NetHandler Connect(string hostport, int timeout)
 		{
 			Regex regex = new Regex("^(.+):(\\d+)$", RegexOptions.Singleline);
-			Match match = regex.Match(ipport);
+			Match match = regex.Match(hostport);
 			return !match.Success ? null :
 				Connect(match.Captures[0].Value, Convert.ToInt32(match.Captures[1].Value), timeout);
 		}
 
-		public NetHandler Connect(string ipport, int timeout, Connected callback)
+		public void Connect(string hostport, int timeout, Action<NetHandler, Exception> callback)
 		{
 			Regex regex = new Regex("^(.+):(\\d+)$", RegexOptions.Singleline);
-			Match match = regex.Match(ipport);
-			return !match.Success ? null :
+			Match match = regex.Match(hostport);
+			if (match.Success)
 				Connect(match.Captures[0].Value, Convert.ToInt32(match.Captures[1].Value), timeout, callback);
 		}
 
-		public NetHandler Connect(string ip, int port, int timeout)
+		public NetHandler Connect(string host, int port, int timeout)
 		{
-			Init();
-			NetHandlerImpl socket = new NetHandlerImpl { Manager = this, Blocking = false };
-			try
+			AutoResetEvent reset = new AutoResetEvent(false);
+			NetHandler socket = null;
+			Exception e = null;
+			ConnectImpl(host, port, timeout, (handler, exception) =>
 			{
-				socket.Connect(ip, port);
-			}
-			catch (SocketException e)
-			{
-				if (e.SocketErrorCode == SocketError.WouldBlock || e.SocketErrorCode == SocketError.InProgress)
-				{
-					if (!(socket.Poll(timeout * 1000, SelectMode.SelectWrite) && !socket.Poll(0, SelectMode.SelectError)))
-					{
-						socket.Close();
-						return null;
-					}
-					lock (newsockets)
-					{
-						newsockets.Add(socket);
-					}
-					return socket;
-				}
-				throw;
-			}
-			if (!(socket.Poll(0, SelectMode.SelectWrite) && !socket.Poll(0, SelectMode.SelectError)))
-			{
-				socket.Close();
-				return null;
-			}
-			lock (newsockets)
-			{
-				newsockets.Add(socket);
-			}
+				socket = handler;
+				e = exception;
+				reset.Set();
+			});
+			reset.WaitOne();
+			reset.Close();
+			if (e != null)
+				throw e;
 			return socket;
 		}
 
-		public NetHandler Connect(string ip, int port, int timeout, Connected callback)
+		public void Connect(string host, int port, int timeout, Action<NetHandler, Exception> callback)
 		{
-			Init();
-			NetHandlerImpl socket = new NetHandlerImpl { Manager = this, Blocking = false };
-			try
+			ConnectImpl(host, port, timeout, (handler, exception) =>
 			{
-				socket.Connect(ip, port);
-			}
-			catch (SocketException e)
-			{
-				if (e.SocketErrorCode == SocketError.WouldBlock || e.SocketErrorCode == SocketError.InProgress)
+				Loop.Run(() =>
 				{
-					new Thread(delegate()
+					callback(handler, exception);
+				});
+			});
+		}
+
+		public void Dispose()
+		{
+			valid = false;
+		}
+
+		public void Close()
+		{
+			Dispose();
+		}
+
+		#region 初始化
+		private void Init()
+		{
+			if (inited)
+				return;
+
+			inited = true;
+
+			new Thread(delegate()
+			{
+				Thread.CurrentThread.Name = "Network Task";
+				List<Socket> reads = new List<Socket>();
+				List<Socket> writers = new List<Socket>();
+				List<Socket> errors = new List<Socket>();
+				Dictionary<Socket, NetHandlerImpl> sockethandlers = new Dictionary<Socket, NetHandlerImpl>();
+
+				byte[] bytes = new byte[64 * 1024];
+
+				while (valid && IsRunning)
+				{
+					if (newsockets.Count > 0)
 					{
-						bool result = socket.Poll(timeout * 1000, SelectMode.SelectWrite) && !socket.Poll(0, SelectMode.SelectError);
-						if (result)
+						lock (newsockets)
 						{
-							lock (newsockets)
+							sockets.AddRange(newsockets);
+							newsockets.Clear();
+						}
+					}
+					if (deletesockets.Count > 0)
+					{
+						lock (deletesockets)
+						{
+							for (int i = 0; i < deletesockets.Count; i++)
 							{
-								newsockets.Add(socket);
+								NetHandlerImpl socket = deletesockets[i];
+								sockets.Remove(socket);
+								socket.Socket.Close();
+								if (settings.events.close != null)
+								{
+									Loop.Run(delegate()
+									{
+										if (settings.events.close != null)
+											settings.events.close(socket);
+									});
+								}
 							}
+							deletesockets.Clear();
+						}
+					}
+					if (sockets.Count == 0)
+					{
+						Thread.Sleep((int)settings.timeout);
+						continue;
+					}
+					for (int i = 0; i < sockets.Count; i++)
+					{
+						NetHandlerImpl socket = sockets[i];
+						sockethandlers.Add(socket.Socket, socket);
+						reads.Add(socket.Socket);
+						errors.Add(socket.Socket);
+						if (socket.need_send)
+							writers.Add(socket.Socket);
+					}
+					Socket.Select(reads, writers, errors, (int)settings.timeout);
+					for (int i = 0; i < writers.Count; i++)
+					{
+						NetHandlerImpl socket = sockethandlers[writers[i]];
+						ByteBuffer buffer = socket.write_buffer;
+						lock (buffer)
+						{
+							int length = socket.Socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
+							buffer.Pop(length);
+							socket.need_send = buffer.length != 0;
+							if (settings.events.write != null)
+							{
+								Loop.Run(delegate()
+								{
+									if (settings.events.write != null)
+										settings.events.write(socket, length);
+								});
+							}
+						}
+					}
+					for (int i = 0; i < reads.Count; i++)
+					{
+						NetHandlerImpl socket = sockethandlers[reads[i]];
+						try
+						{
+							int total = 0;
+							while (socket.Socket.Available > 0)
+							{
+								int length = socket.Socket.Receive(bytes);
+								if (length == 0)
+								{
+									break;
+								}
+								total += length;
+								socket.OnReceive(bytes, length);
+							}
+							if (total == 0)
+							{
+								lock (deletesockets)
+								{
+									deletesockets.Add(socket);
+								}
+							}
+							else
+							{
+								if (settings.events.read != null)
+								{
+									Loop.Run(delegate()
+									{
+										if (settings.events.read != null)
+											settings.events.read(socket, total);
+									});
+								}
+							}
+						}
+						catch (SocketException e)
+						{
+							if (e.SocketErrorCode == SocketError.ConnectionReset ||
+								e.SocketErrorCode == SocketError.ConnectionAborted ||
+								e.SocketErrorCode == SocketError.NotConnected ||
+								e.SocketErrorCode == SocketError.Shutdown)
+							{
+								lock (deletesockets)
+								{
+									deletesockets.Add(socket);
+								}
+							}
+							else
+							{
+								if (settings.events.exception != null)
+								{
+									Loop.Run(delegate()
+									{
+										if (settings.events.exception != null)
+											settings.events.exception(socket, e);
+									});
+								}
+							}
+						}
+						catch (Exception e)
+						{
+							if (settings.events.exception != null)
+							{
+								Loop.Run(delegate()
+								{
+									if (settings.events.exception != null)
+										settings.events.exception(socket, e);
+								});
+							}
+						}
+					}
+					reads.Clear();
+					writers.Clear();
+					errors.Clear();
+					sockethandlers.Clear();
+				}
+			}).Start();
+		}
+		#endregion
+
+		#region 连接
+		private void ConnectImpl(string host, int port, int timeout, Action<NetHandler, Exception> callback)
+		{
+			if (!valid)
+				throw new ObjectDisposedException(ToString());
+			Init();
+			IPAddress ip;
+			if (IPAddress.TryParse(host, out ip))
+			{
+				NetHandlerImpl socket = new NetHandlerImpl(ip.AddressFamily) { Manager = this };
+				Timer timer = new Timer(state =>
+				{
+					socket.Socket.Close();
+				}, null, Timeout.Infinite, Timeout.Infinite);
+				socket.Socket.BeginConnect(ip, port, result =>
+				{
+					try
+					{
+						timer.Dispose();
+					}
+					catch
+					{
+					}
+					Exception exception = null;
+					try
+					{
+						socket.Socket.EndConnect(result);
+						socket.Socket.Blocking = false;
+						lock (newsockets)
+						{
+							newsockets.Add(socket);
+						}
+					}
+					catch (ObjectDisposedException)
+					{
+						exception = new SocketException((int)SocketError.TimedOut);
+					}
+					catch (Exception e)
+					{
+						exception = e;
+						socket.Socket.Close();
+					}
+					callback(exception == null ? socket : null, exception);
+				}, null);
+				timer.Change(timeout, Timeout.Infinite);
+			}
+			else
+			{
+				Stopwatch clock = new Stopwatch();
+				clock.Start();
+				Dns.BeginGetHostAddresses(host, ar =>
+				{
+					clock.Stop();
+					timeout -= (int)clock.ElapsedMilliseconds;
+					try
+					{
+						IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
+						if (timeout > 0)
+						{
+							AddressFamily family = AddressFamily.InterNetworkV6;
+							for (int i = 0; i < iplist.Length; ++i)
+							{
+								if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
+								{
+									family = AddressFamily.InterNetwork;
+									break;
+								}
+							}
+							NetHandlerImpl socket = new NetHandlerImpl(family) { Manager = this };
+							Timer timer = new Timer(state =>
+							{
+								socket.Socket.Close();
+							}, null, Timeout.Infinite, Timeout.Infinite);
+							socket.Socket.BeginConnect(ip, port, result =>
+							{
+								try
+								{
+									timer.Dispose();
+								}
+								catch
+								{
+								}
+								Exception exception = null;
+								try
+								{
+									socket.Socket.EndConnect(result);
+									socket.Socket.Blocking = false;
+									lock (newsockets)
+									{
+										newsockets.Add(socket);
+									}
+								}
+								catch (ObjectDisposedException)
+								{
+									exception = new SocketException((int)SocketError.TimedOut);
+								}
+								catch (Exception e)
+								{
+									exception = e;
+									socket.Socket.Close();
+								}
+								callback(exception == null ? socket : null, exception);
+							}, null);
+							timer.Change(timeout, Timeout.Infinite);
 						}
 						else
 						{
-							socket.Close();
-						}
-						lock (connectings)
-						{
-							connectings.Add(new Connecting { callback = callback, socket = socket, result = result });
-						}
-					}).Start();
-					return socket;
-				}
-				throw;
-			}
-			{
-				bool result = socket.Poll(0, SelectMode.SelectWrite) && !socket.Poll(0, SelectMode.SelectError);
-				if (result)
-				{
-					lock (newsockets)
-					{
-						newsockets.Add(socket);
-					}
-				}
-				else
-				{
-					socket.Close();
-				}
-				lock (connectings)
-				{
-					connectings.Add(new Connecting { callback = callback, socket = socket, result = result });
-				}
-			}
-			return socket;
-		}
-
-		public void Update()
-		{
-			if (connectings.Count > 0)
-			{
-				lock (connectings)
-				{
-					for (int i = 0; i < connectings.Count; i++)
-					{
-						Connecting connecting = connectings[i];
-						connecting.callback(connecting.socket, connecting.result);
-					}
-					connectings.Clear();
-				}
-			}
-			if (acceptings.Count > 0)
-			{
-				lock (acceptings)
-				{
-					for (int i = 0; i < acceptings.Count; i++)
-					{
-						Accepting accepting = acceptings[i];
-						accepting.callback(accepting.socket);
-					}
-					acceptings.Clear();
-				}
-			}
-			if (updates.Count > 0)
-			{
-				lock (updates)
-				{
-					for (int i = 0; i < updates.Count; i++)
-					{
-						UpdateOrder order = updates[i];
-						if (order.socket.listen != null)
-						{
-							switch (order.type)
-							{
-								case OrderType.Receive:
-									order.socket.listen.OnReceive(order.socket, order.socket.read_buffer);
-									break;
-								case OrderType.Close:
-									order.socket.listen.OnClose(order.socket);
-									break;
-								case OrderType.Error:
-									order.socket.listen.OnError(order.socket, (Exception)order.param);
-									break;
-								default:
-									throw new ArgumentOutOfRangeException();
-							}
+							callback(null, new SocketException((int)SocketError.TimedOut));
 						}
 					}
-					updates.Clear();
-					receives.Clear();
-				}
+					catch (Exception e)
+					{
+						callback(null, e);
+					}
+				}, null);
 			}
 		}
+		#endregion
 
-		private class NetHandlerImpl : Socket, NetHandler
+		#region 网络连接的具体类
+		private class NetHandlerImpl : NetHandler
 		{
 			public NetManager Manager;
 			public bool need_send = false;
 			public readonly ByteBuffer write_buffer = new ByteBuffer();
-			public readonly ByteBuffer read_buffer = new ByteBuffer();
-			public readonly ByteBuffer read_buffer_tmp = new ByteBuffer();
-			public NetListener listen = null;
+			public readonly Socket Socket;
+			private Request request;
 
-			public NetHandlerImpl()
-				: base(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+			public NetHandlerImpl(AddressFamily family)
 			{
-				SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
+				Socket = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
+				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
 
 			public NetHandlerImpl(Socket socket)
-				: base(socket.DuplicateAndClose(Process.GetCurrentProcess().Id))
 			{
-				SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
+				Socket = socket;
+				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
 
-			public void Destroy()
+			public override void Close()
 			{
 				lock (Manager.deletesockets)
 				{
@@ -588,44 +811,273 @@ namespace TinyNet
 				}
 			}
 
-			public void Write(byte[] bytes)
-			{
-				Write(bytes, 0, bytes.Length);
-			}
-
-			public void Write(byte[] bytes, int length)
-			{
-				Write(bytes, 0, length);
-			}
-
-			public void Write(byte[] bytes, int offset, int length)
+			public override bool Send(BufferSegment seg)
 			{
 				lock (write_buffer)
 				{
+					if (write_buffer.length >= Manager.settings.sendbytes)
+						return false;
 					need_send = true;
-					write_buffer.Write(bytes, offset, length);
+					write_buffer.Write(seg);
 				}
+				return true;
 			}
 
-			public void Write(IntPtr bytes, int length)
+			public override bool Send(BufferSegment seg1, BufferSegment seg2)
 			{
 				lock (write_buffer)
 				{
+					if (write_buffer.length >= Manager.settings.sendbytes)
+						return false;
 					need_send = true;
-					write_buffer.Write(bytes, length);
+					write_buffer.Write(seg1);
+					write_buffer.Write(seg2);
+				}
+				return true;
+			}
+
+			public override bool Send(BufferSegment seg1, BufferSegment seg2, BufferSegment seg3)
+			{
+				lock (write_buffer)
+				{
+					if (write_buffer.length >= Manager.settings.sendbytes)
+						return false;
+					need_send = true;
+					write_buffer.Write(seg1);
+					write_buffer.Write(seg2);
+					write_buffer.Write(seg3);
+				}
+				return true;
+			}
+
+			public override bool Send(BufferSegment seg, params BufferSegment[] segs)
+			{
+				lock (write_buffer)
+				{
+					if (write_buffer.length >= Manager.settings.sendbytes)
+						return false;
+					need_send = true;
+					write_buffer.Write(seg);
+					for (int i = 0; i < segs.Length; ++i)
+					{
+						write_buffer.Write(segs[i]);
+					}
+				}
+				return true;
+			}
+
+			public override bool Connected
+			{
+				get { return Socket.Connected; }
+			}
+
+			public override IPEndPoint Remote
+			{
+				get
+				{
+					return Socket.RemoteEndPoint as IPEndPoint;
 				}
 			}
 
-			public new NetListener Listen
+			public override IPEndPoint Local
 			{
-				get { return listen; }
-				set { listen = value; }
+				get
+				{
+					return Socket.LocalEndPoint as IPEndPoint;
+				}
 			}
 
-			public bool IsConnected
+			public override short TTL
 			{
-				get { return Connected; }
+				get { return Socket.Ttl; }
+				set { Socket.Ttl = value; }
 			}
+
+			public override bool NoDelay
+			{
+				get { return !Socket.NoDelay; }
+				set { Socket.NoDelay = !value; }
+			}
+
+			public void OnReceive(byte[] bytes, int length)
+			{
+				int offset = 0;
+				int size = length - offset;
+				if (request == null)
+					request = Manager.NewRequest();
+				try
+				{
+					while (size > 0 && request.Input(bytes, offset, ref size))
+					{
+						offset += size;
+						size = length - offset;
+						Request old = request;
+						request = Manager.NewRequest();
+						Loop.Run(delegate()
+						{
+							if (Manager.settings.events.request != null)
+							{
+								Manager.settings.events.request(this, old);
+							}
+							old.Execute(this);
+							Manager.ReleaseRequest(old);
+						});
+					}
+				}
+				catch (Exception e)
+				{
+					Socket.Close();
+					if (Manager.settings.events.exception != null)
+					{
+						Loop.Run(delegate()
+						{
+							if (Manager.settings.events.exception != null)
+								Manager.settings.events.exception(this, e);
+						});
+					}
+				}
+			}
+		}
+
+		protected abstract Request NewRequest();
+		protected abstract void ReleaseRequest(Request request);
+		#endregion
+
+		#region 主循环调用
+		private static class Loop
+		{
+			private static bool initialized = false;
+			private static List<Action> actions = new List<Action>();
+			private static List<Action> actions_tmp = new List<Action>();
+			private static bool threadInit = false;
+			private static int threadID = 0;
+
+			public static void Initialize()
+			{
+				if (!initialized)
+				{
+					if (!Application.isPlaying)
+						return;
+					initialized = true;
+					GameObject go = new GameObject("Network");
+					UnityObject.DontDestroyOnLoad(go);
+					go.hideFlags |= HideFlags.HideInHierarchy;
+					go.AddComponent<Updater>();
+				}
+			}
+
+			public static void Run(Action action)
+			{
+				if (threadInit && threadID == Thread.CurrentThread.ManagedThreadId)
+				{
+					action();
+				}
+				else
+				{
+					lock (actions)
+					{
+						actions.Add(action);
+					}
+				}
+			}
+
+			private class Updater : MonoBehaviour
+			{
+				void Start()
+				{
+					threadID = Thread.CurrentThread.ManagedThreadId;
+					threadInit = true;
+				}
+
+				void Update()
+				{
+					lock (actions)
+					{
+						var tmp = actions_tmp;
+						actions_tmp = actions;
+						actions = tmp;
+					}
+					for (int i = 0, j = actions_tmp.Count; i < j; ++i)
+					{
+						try
+						{
+							actions_tmp[i]();
+						}
+						catch (Exception)
+						{
+						}
+					}
+					actions_tmp.Clear();
+				}
+
+				void OnApplicationQuit()
+				{
+					IsRunning = false;
+				}
+			}
+		}
+		#endregion
+	}
+
+	public sealed class NetManager<T> : NetManager
+		where T : Request, new()
+	{
+		public NetManager()
+			: base(new Settings()) { }
+		public NetManager(Settings settings)
+			: base(settings) { }
+
+		protected override Request NewRequest()
+		{
+			return new T();
+		}
+
+		protected override void ReleaseRequest(Request request)
+		{
+			request.Reset();
+		}
+	}
+
+	public class UTF8StringRequest : Request<string>
+	{
+		protected override int PreTest(ByteBuffer buffer, byte[] bytes, int offset, int length)
+		{
+			int len = length;
+			for (int i = offset; i < length; ++i)
+			{
+				if (bytes[i] == 0)
+				{
+					len = i - offset + 1;
+					break;
+				}
+			}
+			buffer.Write(bytes, offset, len);
+			return len;
+		}
+
+		protected override bool Test(ByteBuffer buffer)
+		{
+			if (buffer.array[buffer.offset + buffer.length - 1] == 0)
+			{
+				Value = System.Text.Encoding.UTF8.GetString(buffer.array, buffer.offset, buffer.length - 1);
+				buffer.Reset();
+				return true;
+			}
+			return false;
+		}
+
+		public override bool Send(NetHandler handler)
+		{
+
+			if (!handler.Send(BufferSegment.Make(System.Text.Encoding.UTF8.GetBytes(Value)), BufferSegment.Make(0)))
+				return false;
+			return true;
+		}
+
+		public override void Reset()
+		{
+			base.Reset();
+			Value = null;
 		}
 	}
 }
