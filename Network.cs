@@ -458,7 +458,17 @@ namespace TinyNet
 			Regex regex = new Regex("^(?<host>.+):(?<port>\\d+)$", RegexOptions.Multiline);
 			Match match = regex.Match(hostport);
 			if (match.Success)
+			{
 				Connect(match.Groups["host"].Captures[0].Value, Convert.ToInt32(match.Groups["port"].Captures[0].Value), timeout, callback);
+			}
+			else
+			{
+				Exception e = new ArgumentException();
+				Loop.RunDelay(0, () =>
+				{
+					callback(null, e);
+				});
+			}
 		}
 
 		public NetHandler Connect(string host, int port, int timeout)
