@@ -449,8 +449,9 @@ namespace TinyNet
 		{
 			Regex regex = new Regex("^(?<host>.+):(?<port>\\d+)$", RegexOptions.Multiline);
 			Match match = regex.Match(hostport);
-			return !match.Success ? null :
-				Connect(match.Groups["host"].Captures[0].Value, Convert.ToInt32(match.Groups["port"].Captures[0].Value), timeout);
+			if (!match.Success)
+				throw new ArgumentException();
+			return Connect(match.Groups["host"].Captures[0].Value, Convert.ToInt32(match.Groups["port"].Captures[0].Value), timeout);
 		}
 
 		public void Connect(string hostport, int timeout, Action<NetHandler, Exception> callback)
