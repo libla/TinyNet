@@ -465,7 +465,7 @@ namespace TinyNet
 			else
 			{
 				Exception e = new ArgumentException();
-				Loop.RunDelay(0, () =>
+				Loop.RunDelay(() =>
 				{
 					callback(null, e);
 				});
@@ -960,6 +960,9 @@ namespace TinyNet
 			private static bool initialized = false;
 			private static List<Action> actions = new List<Action>();
 			private static List<Action> actions_tmp = new List<Action>();
+			private static readonly List<Action> actions_delay = new List<Action>();
+			private static readonly List<Action> actions_delay_tmp = new List<Action>();
+			private static readonly List<Action> actions_delay_async = new List<Action>();
 			private static bool threadInit = false;
 			private static int threadID = 0;
 
@@ -992,6 +995,21 @@ namespace TinyNet
 				}
 			}
 
+			public static void RunDelay(Action action)
+			{
+				if (threadInit && threadID == Thread.CurrentThread.ManagedThreadId)
+				{
+					actions_delay.Add(action);
+				}
+				else
+				{
+					lock (actions_delay_async)
+					{
+						actions_delay_async.Add(action);
+					}
+				}
+			}
+
 			private class Updater : MonoBehaviour
 			{
 				void Start()
@@ -1002,23 +1020,49 @@ namespace TinyNet
 
 				void Update()
 				{
-					lock (actions)
+					if (actions.Count > 0)
 					{
-						var tmp = actions_tmp;
-						actions_tmp = actions;
-						actions = tmp;
+						lock (actions)
+						{
+							var tmp = actions_tmp;
+							actions_tmp = actions;
+							actions = tmp;
+						}
+						for (int i = 0, j = actions_tmp.Count; i < j; ++i)
+						{
+							try
+							{
+								actions_tmp[i]();
+							}
+							catch (Exception)
+							{
+							}
+						}
+						actions_tmp.Clear();
 					}
-					for (int i = 0, j = actions_tmp.Count; i < j; ++i)
+					for (int i = 0; i < actions_delay.Count; i++)
+						actions_delay_tmp.Add(actions_delay[i]);
+					actions_delay.Clear();
+					if (actions_delay_async.Count > 0)
+					{
+						lock (actions_delay_async)
+						{
+							for (int i = 0; i < actions_delay_async.Count; i++)
+								actions_delay_tmp.Add(actions_delay_async[i]);
+							actions_delay_async.Clear();
+						}
+					}
+					for (int i = 0; i < actions_delay_tmp.Count; i++)
 					{
 						try
 						{
-							actions_tmp[i]();
+							actions_delay_tmp[i]();
 						}
 						catch (Exception)
 						{
 						}
 					}
-					actions_tmp.Clear();
+					actions_delay_tmp.Clear();
 				}
 
 				void OnApplicationQuit()
