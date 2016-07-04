@@ -680,116 +680,73 @@ namespace TinyNet
 			if (!valid)
 				throw new ObjectDisposedException(ToString());
 			Init();
-			IPAddress ip;
-			if (IPAddress.TryParse(host, out ip))
+			Stopwatch clock = new Stopwatch();
+			clock.Start();
+			Dns.BeginGetHostAddresses(host, ar =>
 			{
-				NetHandlerImpl socket = new NetHandlerImpl(ip.AddressFamily) { Manager = this };
-				Timer timer = new Timer(state =>
+				clock.Stop();
+				timeout -= (int)clock.ElapsedMilliseconds;
+				try
 				{
-					socket.Socket.Close();
-				}, null, Timeout.Infinite, Timeout.Infinite);
-				socket.Socket.BeginConnect(ip, port, result =>
-				{
-					try
+					IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
+					if (timeout > 0)
 					{
-						timer.Dispose();
-					}
-					catch
-					{
-					}
-					Exception exception = null;
-					try
-					{
-						socket.Socket.EndConnect(result);
-						socket.Socket.Blocking = false;
-						lock (newsockets)
+						AddressFamily family = AddressFamily.InterNetworkV6;
+						for (int i = 0; i < iplist.Length; ++i)
 						{
-							newsockets.Add(socket);
-						}
-					}
-					catch (ObjectDisposedException)
-					{
-						exception = new SocketException((int)SocketError.TimedOut);
-					}
-					catch (Exception e)
-					{
-						exception = e;
-						socket.Socket.Close();
-					}
-					callback(exception == null ? socket : null, exception);
-				}, null);
-				timer.Change(timeout, Timeout.Infinite);
-			}
-			else
-			{
-				Stopwatch clock = new Stopwatch();
-				clock.Start();
-				Dns.BeginGetHostAddresses(host, ar =>
-				{
-					clock.Stop();
-					timeout -= (int)clock.ElapsedMilliseconds;
-					try
-					{
-						IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
-						if (timeout > 0)
-						{
-							AddressFamily family = AddressFamily.InterNetworkV6;
-							for (int i = 0; i < iplist.Length; ++i)
+							if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
 							{
-								if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
+								family = AddressFamily.InterNetwork;
+								break;
+							}
+						}
+						NetHandlerImpl socket = new NetHandlerImpl(family) { Manager = this };
+						Timer timer = new Timer(state =>
+						{
+							socket.Socket.Close();
+						}, null, Timeout.Infinite, Timeout.Infinite);
+						socket.Socket.BeginConnect(iplist, port, result =>
+						{
+							try
+							{
+								timer.Dispose();
+							}
+							catch
+							{
+							}
+							Exception exception = null;
+							try
+							{
+								socket.Socket.EndConnect(result);
+								socket.Socket.Blocking = false;
+								lock (newsockets)
 								{
-									family = AddressFamily.InterNetwork;
-									break;
+									newsockets.Add(socket);
 								}
 							}
-							NetHandlerImpl socket = new NetHandlerImpl(family) { Manager = this };
-							Timer timer = new Timer(state =>
+							catch (ObjectDisposedException)
 							{
+								exception = new SocketException((int)SocketError.TimedOut);
+							}
+							catch (Exception e)
+							{
+								exception = e;
 								socket.Socket.Close();
-							}, null, Timeout.Infinite, Timeout.Infinite);
-							socket.Socket.BeginConnect(iplist, port, result =>
-							{
-								try
-								{
-									timer.Dispose();
-								}
-								catch
-								{
-								}
-								Exception exception = null;
-								try
-								{
-									socket.Socket.EndConnect(result);
-									socket.Socket.Blocking = false;
-									lock (newsockets)
-									{
-										newsockets.Add(socket);
-									}
-								}
-								catch (ObjectDisposedException)
-								{
-									exception = new SocketException((int)SocketError.TimedOut);
-								}
-								catch (Exception e)
-								{
-									exception = e;
-									socket.Socket.Close();
-								}
-								callback(exception == null ? socket : null, exception);
-							}, null);
-							timer.Change(timeout, Timeout.Infinite);
-						}
-						else
-						{
-							callback(null, new SocketException((int)SocketError.TimedOut));
-						}
+							}
+							callback(exception == null ? socket : null, exception);
+						}, null);
+						timer.Change(timeout, Timeout.Infinite);
 					}
-					catch (Exception e)
+					else
 					{
-						callback(null, e);
+						callback(null, new SocketException((int)SocketError.TimedOut));
 					}
-				}, null);
-			}
+				}
+				catch (Exception e)
+				{
+					callback(null, e);
+				}
+			}, null);
 		}
 		#endregion
 
