@@ -378,7 +378,7 @@ namespace TinyNet
 			if (!valid)
 				throw new ObjectDisposedException(ToString());
 			Init();
-			new Thread(delegate()
+			new Thread(delegate ()
 			{
 				Thread.CurrentThread.Name = "Network Server";
 				TcpListener server = new TcpListener(IPAddress.Any, port);
@@ -409,7 +409,7 @@ namespace TinyNet
 						break;
 					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket()) { Manager = this };
 					socket.Socket.Blocking = false;
-					Loop.Run(delegate()
+					Loop.Run(delegate ()
 					{
 						ctrl.action(socket);
 					});
@@ -519,7 +519,7 @@ namespace TinyNet
 
 			inited = true;
 
-			new Thread(delegate()
+			new Thread(delegate ()
 			{
 				Thread.CurrentThread.Name = "Network Task";
 				List<Socket> reads = new List<Socket>();
@@ -550,7 +550,7 @@ namespace TinyNet
 								socket.Socket.Close();
 								if (settings.events.close != null)
 								{
-									Loop.Run(delegate()
+									Loop.Run(delegate ()
 									{
 										if (settings.events.close != null)
 											settings.events.close(socket);
@@ -587,7 +587,7 @@ namespace TinyNet
 							socket.need_send = buffer.length != 0;
 							if (settings.events.write != null)
 							{
-								Loop.Run(delegate()
+								Loop.Run(delegate ()
 								{
 									if (settings.events.write != null)
 										settings.events.write(socket, length);
@@ -622,7 +622,7 @@ namespace TinyNet
 							{
 								if (settings.events.read != null)
 								{
-									Loop.Run(delegate()
+									Loop.Run(delegate ()
 									{
 										if (settings.events.read != null)
 											settings.events.read(socket, total);
@@ -646,7 +646,7 @@ namespace TinyNet
 							{
 								if (settings.events.exception != null)
 								{
-									Loop.Run(delegate()
+									Loop.Run(delegate ()
 									{
 										if (settings.events.exception != null)
 											settings.events.exception(socket, e);
@@ -658,7 +658,7 @@ namespace TinyNet
 						{
 							if (settings.events.exception != null)
 							{
-								Loop.Run(delegate()
+								Loop.Run(delegate ()
 								{
 									if (settings.events.exception != null)
 										settings.events.exception(socket, e);
@@ -697,12 +697,12 @@ namespace TinyNet
 					IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
 					if (timeout > 0)
 					{
-						AddressFamily family = AddressFamily.InterNetworkV6;
+						AddressFamily family = AddressFamily.InterNetwork;
 						for (int i = 0; i < iplist.Length; ++i)
 						{
-							if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
+							if (iplist[i].AddressFamily == AddressFamily.InterNetworkV6)
 							{
-								family = AddressFamily.InterNetwork;
+								family = AddressFamily.InterNetworkV6;
 								break;
 							}
 						}
@@ -887,7 +887,7 @@ namespace TinyNet
 						size = length - offset;
 						Request old = request;
 						request = Manager.NewRequest();
-						Loop.Run(delegate()
+						Loop.Run(delegate ()
 						{
 							if (Manager.settings.events.request != null)
 							{
@@ -903,7 +903,7 @@ namespace TinyNet
 					Socket.Close();
 					if (Manager.settings.events.exception != null)
 					{
-						Loop.Run(delegate()
+						Loop.Run(delegate ()
 						{
 							if (Manager.settings.events.exception != null)
 								Manager.settings.events.exception(this, e);
