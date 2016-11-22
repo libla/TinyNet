@@ -303,7 +303,8 @@ namespace TinyNet
 	public class Settings
 	{
 		public uint timeout;
-		public int sendbytes;
+		public int capacity;
+		public int worklimit;
 		public Events events;
 
 		public struct Events
@@ -318,7 +319,8 @@ namespace TinyNet
 		public Settings()
 		{
 			timeout = 5;
-			sendbytes = 2 << 24;
+			capacity = 2 << 24;
+			worklimit = 4;
 		}
 	}
 	#endregion
@@ -346,14 +348,14 @@ namespace TinyNet
 	public abstract class NetManager : IDisposable
 	{
 		protected readonly Settings settings = null;
-		private static bool IsRunning = true;
-
-		private bool inited = false;
-		private bool valid = true;
-		private readonly List<NetHandlerImpl> sockets = new List<NetHandlerImpl>();
-		private readonly List<NetHandlerImpl> newsockets = new List<NetHandlerImpl>();
-		private readonly List<NetHandlerImpl> deletesockets = new List<NetHandlerImpl>();
+		private bool running = true;
+		private int workcount = 0;
+		private readonly Queue<NetHandlerImpl> workqueue = new Queue<NetHandlerImpl>();
+		private readonly Dictionary<NetHandlerImpl, bool> workindex = new Dictionary<NetHandlerImpl, bool>();
 		private readonly Dictionary<int, Control> listens = new Dictionary<int, Control>();
+		private readonly Dictionary<NetHandlerImpl, bool> sockets = new Dictionary<NetHandlerImpl, bool>();
+
+		private static readonly Dictionary<NetManager, bool> managers = new Dictionary<NetManager, bool>();
 
 		#region 内部使用的类
 		private class Control
@@ -366,6 +368,10 @@ namespace TinyNet
 		protected NetManager(Settings settings)
 		{
 			this.settings = settings;
+			lock (managers)
+			{
+				managers.Add(this, true);
+			}
 		}
 
 		public static void Initialize()
@@ -375,10 +381,9 @@ namespace TinyNet
 
 		public void Listen(int port, Action<NetHandler> callback)
 		{
-			if (!valid)
+			if (!running)
 				throw new ObjectDisposedException(ToString());
-			Init();
-			new Thread(delegate ()
+			new Thread(delegate()
 			{
 				Thread.CurrentThread.Name = "Network Server";
 				TcpListener server = new TcpListener(IPAddress.Any, port);
@@ -397,7 +402,7 @@ namespace TinyNet
 					}
 				}
 				ctrl.action = callback;
-				while (valid && IsRunning)
+				while (running)
 				{
 					if (!server.Server.Poll(1000, SelectMode.SelectRead))
 					{
@@ -407,16 +412,13 @@ namespace TinyNet
 					}
 					if (!server.Pending())
 						break;
-					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket()) { Manager = this };
+					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket(), this);
 					socket.Socket.Blocking = false;
-					Loop.Run(delegate ()
+					socket.OnConnected();
+					Loop.Run(() =>
 					{
 						ctrl.action(socket);
 					});
-					lock (newsockets)
-					{
-						newsockets.Add(socket);
-					}
 				}
 				lock (listens)
 				{
@@ -432,7 +434,7 @@ namespace TinyNet
 
 		public void Stop(int port)
 		{
-			if (!valid)
+			if (!running)
 				throw new ObjectDisposedException(ToString());
 			lock (listens)
 			{
@@ -503,7 +505,29 @@ namespace TinyNet
 
 		public void Dispose()
 		{
-			valid = false;
+			lock (managers)
+			{
+				if (!managers.Remove(this))
+					return;
+			}
+			running = false;
+			lock (workqueue)
+			{
+				Monitor.PulseAll(workqueue);
+			}
+			List<NetHandlerImpl> keys;
+			lock (sockets)
+			{
+				keys = new List<NetHandlerImpl>(sockets.Count);
+				foreach (var kv in sockets)
+				{
+					keys.Add(kv.Key);
+				}
+			}
+			foreach (var handler in keys)
+			{
+				handler.Close();
+			}
 		}
 
 		public void Close()
@@ -511,181 +535,11 @@ namespace TinyNet
 			Dispose();
 		}
 
-		#region 初始化
-		private void Init()
-		{
-			if (inited)
-				return;
-
-			inited = true;
-
-			new Thread(delegate ()
-			{
-				Thread.CurrentThread.Name = "Network Task";
-				List<Socket> reads = new List<Socket>();
-				List<Socket> writers = new List<Socket>();
-				List<Socket> errors = new List<Socket>();
-				Dictionary<Socket, NetHandlerImpl> sockethandlers = new Dictionary<Socket, NetHandlerImpl>();
-
-				byte[] bytes = new byte[64 * 1024];
-
-				while (valid && IsRunning)
-				{
-					if (newsockets.Count > 0)
-					{
-						lock (newsockets)
-						{
-							sockets.AddRange(newsockets);
-							newsockets.Clear();
-						}
-					}
-					if (deletesockets.Count > 0)
-					{
-						lock (deletesockets)
-						{
-							for (int i = 0; i < deletesockets.Count; i++)
-							{
-								NetHandlerImpl socket = deletesockets[i];
-								sockets.Remove(socket);
-								socket.Socket.Close();
-								if (settings.events.close != null)
-								{
-									Loop.Run(delegate ()
-									{
-										if (settings.events.close != null)
-											settings.events.close(socket);
-									});
-								}
-							}
-							deletesockets.Clear();
-						}
-					}
-					if (sockets.Count == 0)
-					{
-						Thread.Sleep((int)settings.timeout);
-						continue;
-					}
-					for (int i = 0; i < sockets.Count; i++)
-					{
-						NetHandlerImpl socket = sockets[i];
-						sockethandlers.Add(socket.Socket, socket);
-						reads.Add(socket.Socket);
-						errors.Add(socket.Socket);
-						if (socket.need_send)
-							writers.Add(socket.Socket);
-					}
-					Socket.Select(reads, writers, null, (int)settings.timeout);
-					Socket.Select(null, null, errors, 0);
-					for (int i = 0; i < writers.Count; i++)
-					{
-						NetHandlerImpl socket = sockethandlers[writers[i]];
-						ByteBuffer buffer = socket.write_buffer;
-						lock (buffer)
-						{
-							int length = socket.Socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
-							buffer.Pop(length);
-							socket.need_send = buffer.length != 0;
-							if (settings.events.write != null)
-							{
-								Loop.Run(delegate ()
-								{
-									if (settings.events.write != null)
-										settings.events.write(socket, length);
-								});
-							}
-						}
-					}
-					for (int i = 0; i < reads.Count; i++)
-					{
-						NetHandlerImpl socket = sockethandlers[reads[i]];
-						try
-						{
-							int total = 0;
-							while (socket.Socket.Available > 0)
-							{
-								int length = socket.Socket.Receive(bytes);
-								if (length == 0)
-								{
-									break;
-								}
-								total += length;
-								socket.OnReceive(bytes, length);
-							}
-							if (total == 0)
-							{
-								lock (deletesockets)
-								{
-									deletesockets.Add(socket);
-								}
-							}
-							else
-							{
-								if (settings.events.read != null)
-								{
-									Loop.Run(delegate ()
-									{
-										if (settings.events.read != null)
-											settings.events.read(socket, total);
-									});
-								}
-							}
-						}
-						catch (SocketException e)
-						{
-							if (e.SocketErrorCode == SocketError.ConnectionReset ||
-								e.SocketErrorCode == SocketError.ConnectionAborted ||
-								e.SocketErrorCode == SocketError.NotConnected ||
-								e.SocketErrorCode == SocketError.Shutdown)
-							{
-								lock (deletesockets)
-								{
-									deletesockets.Add(socket);
-								}
-							}
-							else
-							{
-								if (settings.events.exception != null)
-								{
-									Loop.Run(delegate ()
-									{
-										if (settings.events.exception != null)
-											settings.events.exception(socket, e);
-									});
-								}
-							}
-						}
-						catch (Exception e)
-						{
-							if (settings.events.exception != null)
-							{
-								Loop.Run(delegate ()
-								{
-									if (settings.events.exception != null)
-										settings.events.exception(socket, e);
-								});
-							}
-						}
-					}
-					reads.Clear();
-					writers.Clear();
-					errors.Clear();
-					sockethandlers.Clear();
-				}
-				for (int i = 0; i < sockets.Count; ++i)
-				{
-					sockets[i].Socket.Close();
-				}
-				sockets.Clear();
-			}).Start();
-		}
-		#endregion
-
 		#region 连接
 		private void ConnectImpl(string host, int port, int timeout, Action<NetHandler, Exception> callback)
 		{
-			if (!valid)
+			if (!running)
 				throw new ObjectDisposedException(ToString());
-			Init();
 			Stopwatch clock = new Stopwatch();
 			clock.Start();
 			Dns.BeginGetHostAddresses(host, ar =>
@@ -697,16 +551,16 @@ namespace TinyNet
 					IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
 					if (timeout > 0)
 					{
-						AddressFamily family = AddressFamily.InterNetwork;
+						AddressFamily family = AddressFamily.InterNetworkV6;
 						for (int i = 0; i < iplist.Length; ++i)
 						{
-							if (iplist[i].AddressFamily == AddressFamily.InterNetworkV6)
+							if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
 							{
-								family = AddressFamily.InterNetworkV6;
+								family = AddressFamily.InterNetwork;
 								break;
 							}
 						}
-						NetHandlerImpl socket = new NetHandlerImpl(family) { Manager = this };
+						NetHandlerImpl socket = new NetHandlerImpl(family, this);
 						Timer timer = new Timer(state =>
 						{
 							socket.Socket.Close();
@@ -725,10 +579,7 @@ namespace TinyNet
 							{
 								socket.Socket.EndConnect(result);
 								socket.Socket.Blocking = false;
-								lock (newsockets)
-								{
-									newsockets.Add(socket);
-								}
+								socket.OnConnected();
 							}
 							catch (ObjectDisposedException)
 							{
@@ -756,87 +607,261 @@ namespace TinyNet
 		}
 		#endregion
 
+		private void SendQueue(NetHandlerImpl handler)
+		{
+			lock (workqueue)
+			{
+				if (!workindex.ContainsKey(handler))
+				{
+					workindex.Add(handler, true);
+					workqueue.Enqueue(handler);
+					Monitor.Pulse(workqueue);
+				}
+			}
+			if (workcount >= settings.worklimit)
+				return;
+			if (Interlocked.Increment(ref workcount) > settings.worklimit)
+			{
+				Interlocked.Decrement(ref workcount);
+				return;
+			}
+			new Thread(delegate()
+			{
+				Thread.CurrentThread.Name = "Network Write";
+				while (running)
+				{
+					handler = null;
+					lock (workqueue)
+					{
+						while (running)
+						{
+							if (workqueue.Count != 0)
+							{
+								handler = workqueue.Dequeue();
+								workindex.Remove(handler);
+								break;
+							}
+							Monitor.Wait(workqueue);
+						}
+					}
+					if (handler != null)
+					{
+						bool result;
+						try
+						{
+							result = handler.Socket.Poll((int)settings.timeout * 1000, SelectMode.SelectWrite);
+						}
+						catch (ObjectDisposedException)
+						{
+							continue;
+						}
+						if (result)
+						{
+							if (!handler.SendReady())
+								continue;
+						}
+						lock (workqueue)
+						{
+							if (!workindex.ContainsKey(handler))
+							{
+								workindex.Add(handler, true);
+								workqueue.Enqueue(handler);
+							}
+						}
+					}
+				}
+			}).Start();
+		}
+
 		#region 网络连接的具体类
 		private class NetHandlerImpl : NetHandler
 		{
-			public NetManager Manager;
-			public bool need_send = false;
-			public readonly ByteBuffer write_buffer = new ByteBuffer();
 			public readonly Socket Socket;
+
+			public readonly ByteBuffer buffer = new ByteBuffer();
+			private readonly NetManager manager;
 			private Request request;
 
-			public NetHandlerImpl(AddressFamily family)
+			public NetHandlerImpl(AddressFamily family, NetManager manager)
 			{
+				this.manager = manager;
 				Socket = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
 				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
 
-			public NetHandlerImpl(Socket socket)
+			public NetHandlerImpl(Socket socket, NetManager manager)
 			{
+				this.manager = manager;
 				Socket = socket;
 				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
 
+			public void OnConnected()
+			{
+				lock (manager.sockets)
+				{
+					manager.sockets.Add(this, true);
+				}
+				new Thread(delegate()
+				{
+					Thread.CurrentThread.Name = "Network Read";
+					byte[] bytes = new byte[64 * 1024];
+					while (manager.running)
+					{
+						bool result;
+						try
+						{
+							result = Socket.Poll(-1, SelectMode.SelectRead);
+						}
+						catch (ObjectDisposedException)
+						{
+							lock (manager.sockets)
+							{
+								manager.sockets.Remove(this);
+							}
+							break;
+						}
+						if (result)
+						{
+							int total = 0;
+							try
+							{
+								while (Socket.Available > 0)
+								{
+									int length = Socket.Receive(bytes);
+									if (length == 0)
+									{
+										break;
+									}
+									total += length;
+									OnReceive(bytes, length);
+								}
+								if (total == 0)
+								{
+									Close();
+									break;
+								}
+							}
+							catch (SocketException e)
+							{
+								if (e.SocketErrorCode == SocketError.ConnectionReset ||
+									e.SocketErrorCode == SocketError.ConnectionAborted ||
+									e.SocketErrorCode == SocketError.NotConnected ||
+									e.SocketErrorCode == SocketError.Shutdown)
+								{
+									Close();
+									break;
+								}
+								if (manager.settings.events.exception != null)
+								{
+									Loop.Run(() =>
+									{
+										if (manager.settings.events.exception != null)
+											manager.settings.events.exception(this, e);
+									});
+								}
+							}
+							catch (ObjectDisposedException)
+							{
+								lock (manager.sockets)
+								{
+									manager.sockets.Remove(this);
+								}
+								break;
+							}
+							catch (Exception e)
+							{
+								if (manager.settings.events.exception != null)
+								{
+									Loop.Run(() =>
+									{
+										if (manager.settings.events.exception != null)
+											manager.settings.events.exception(this, e);
+									});
+								}
+							}
+							if (total != 0 && manager.settings.events.read != null)
+							{
+								Loop.Run(() =>
+								{
+									if (manager.settings.events.read != null)
+										manager.settings.events.read(this, total);
+								});
+							}
+						}
+					}
+				}).Start();
+			}
+
 			public override void Close()
 			{
-				lock (Manager.deletesockets)
+				Socket.Close();
+				lock (manager.sockets)
 				{
-					Manager.deletesockets.Add(this);
+					manager.sockets.Remove(this);
+				}
+				if (manager.settings.events.close != null)
+				{
+					Loop.Run(() =>
+					{
+						if (manager.settings.events.close != null)
+							manager.settings.events.close(this);
+					});
 				}
 			}
 
 			public override bool Send(BufferSegment seg)
 			{
-				lock (write_buffer)
+				lock (buffer)
 				{
-					if (write_buffer.length >= Manager.settings.sendbytes)
+					if (buffer.length >= manager.settings.capacity)
 						return false;
-					need_send = true;
-					write_buffer.Write(seg);
+					buffer.Write(seg);
 				}
+				manager.SendQueue(this);
 				return true;
 			}
 
 			public override bool Send(BufferSegment seg1, BufferSegment seg2)
 			{
-				lock (write_buffer)
+				lock (buffer)
 				{
-					if (write_buffer.length >= Manager.settings.sendbytes)
+					if (buffer.length >= manager.settings.capacity)
 						return false;
-					need_send = true;
-					write_buffer.Write(seg1);
-					write_buffer.Write(seg2);
+					buffer.Write(seg1);
+					buffer.Write(seg2);
 				}
+				manager.SendQueue(this);
 				return true;
 			}
 
 			public override bool Send(BufferSegment seg1, BufferSegment seg2, BufferSegment seg3)
 			{
-				lock (write_buffer)
+				lock (buffer)
 				{
-					if (write_buffer.length >= Manager.settings.sendbytes)
+					if (buffer.length >= manager.settings.capacity)
 						return false;
-					need_send = true;
-					write_buffer.Write(seg1);
-					write_buffer.Write(seg2);
-					write_buffer.Write(seg3);
+					buffer.Write(seg1);
+					buffer.Write(seg2);
+					buffer.Write(seg3);
 				}
+				manager.SendQueue(this);
 				return true;
 			}
 
 			public override bool Send(BufferSegment seg, params BufferSegment[] segs)
 			{
-				lock (write_buffer)
+				lock (buffer)
 				{
-					if (write_buffer.length >= Manager.settings.sendbytes)
+					if (buffer.length >= manager.settings.capacity)
 						return false;
-					need_send = true;
-					write_buffer.Write(seg);
+					buffer.Write(seg);
 					for (int i = 0; i < segs.Length; ++i)
 					{
-						write_buffer.Write(segs[i]);
+						buffer.Write(segs[i]);
 					}
 				}
+				manager.SendQueue(this);
 				return true;
 			}
 
@@ -873,12 +898,45 @@ namespace TinyNet
 				set { Socket.NoDelay = !value; }
 			}
 
-			public void OnReceive(byte[] bytes, int length)
+			public bool SendReady()
+			{
+				int length = 0;
+				bool needsend = false;
+				bool sended = false;
+				lock (buffer)
+				{
+					if (buffer.length != 0)
+					{
+						try
+						{
+							length = Socket.Send(buffer.array, buffer.offset, buffer.length, SocketFlags.None);
+						}
+						catch (ObjectDisposedException)
+						{
+							return false;
+						}
+						sended = true;
+						buffer.Pop(length);
+						needsend = buffer.length != 0;
+					}
+				}
+				if (sended && manager.settings.events.write != null)
+				{
+					Loop.Run(() =>
+					{
+						if (manager.settings.events.write != null)
+							manager.settings.events.write(this, length);
+					});
+				}
+				return needsend;
+			}
+
+			private void OnReceive(byte[] bytes, int length)
 			{
 				int offset = 0;
 				int size = length - offset;
 				if (request == null)
-					request = Manager.NewRequest();
+					request = manager.NewRequest();
 				try
 				{
 					while (size > 0 && request.Input(bytes, offset, ref size))
@@ -886,27 +944,35 @@ namespace TinyNet
 						offset += size;
 						size = length - offset;
 						Request old = request;
-						request = Manager.NewRequest();
-						Loop.Run(delegate ()
+						request = manager.NewRequest();
+						Loop.Run(delegate()
 						{
-							if (Manager.settings.events.request != null)
+							if (manager.settings.events.request != null)
 							{
-								Manager.settings.events.request(this, old);
+								manager.settings.events.request(this, old);
 							}
 							old.Execute(this);
-							Manager.ReleaseRequest(old);
+							manager.ReleaseRequest(old);
 						});
 					}
 				}
 				catch (Exception e)
 				{
 					Socket.Close();
-					if (Manager.settings.events.exception != null)
+					if (manager.settings.events.close != null)
 					{
-						Loop.Run(delegate ()
+						Loop.Run(delegate()
 						{
-							if (Manager.settings.events.exception != null)
-								Manager.settings.events.exception(this, e);
+							if (manager.settings.events.close != null)
+								manager.settings.events.close(this);
+						});
+					}
+					if (manager.settings.events.exception != null)
+					{
+						Loop.Run(delegate()
+						{
+							if (manager.settings.events.exception != null)
+								manager.settings.events.exception(this, e);
 						});
 					}
 				}
@@ -916,11 +982,12 @@ namespace TinyNet
 		protected abstract Request NewRequest();
 		protected abstract void ReleaseRequest(Request request);
 		#endregion
-
+		
 		#region 主循环调用
 		private static class Loop
 		{
 			private static bool initialized = false;
+			private static readonly object actions_mtx = new object();
 			private static List<Action> actions = new List<Action>();
 			private static List<Action> actions_tmp = new List<Action>();
 			private static readonly List<Action> actions_delay = new List<Action>();
@@ -951,7 +1018,7 @@ namespace TinyNet
 				}
 				else
 				{
-					lock (actions)
+					lock (actions_mtx)
 					{
 						actions.Add(action);
 					}
@@ -985,7 +1052,7 @@ namespace TinyNet
 				{
 					if (actions.Count > 0)
 					{
-						lock (actions)
+						lock (actions_mtx)
 						{
 							var tmp = actions_tmp;
 							actions_tmp = actions;
@@ -1030,7 +1097,19 @@ namespace TinyNet
 
 				void OnApplicationQuit()
 				{
-					IsRunning = false;
+					List<NetManager> keys;
+					lock (managers)
+					{
+						keys = new List<NetManager>(managers.Count);
+						foreach (var kv in managers)
+						{
+							keys.Add(kv.Key);
+						}
+					}
+					foreach (var manager in keys)
+					{
+						manager.Dispose();
+					}
 				}
 			}
 		}
