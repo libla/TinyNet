@@ -383,7 +383,7 @@ namespace TinyNet
 		{
 			if (!running)
 				throw new ObjectDisposedException(ToString());
-			new Thread(delegate()
+			new Thread(delegate ()
 			{
 				Thread.CurrentThread.Name = "Network Server";
 				TcpListener server = new TcpListener(IPAddress.Any, port);
@@ -551,12 +551,12 @@ namespace TinyNet
 					IPAddress[] iplist = Dns.EndGetHostAddresses(ar);
 					if (timeout > 0)
 					{
-						AddressFamily family = AddressFamily.InterNetworkV6;
+						AddressFamily family = AddressFamily.InterNetwork;
 						for (int i = 0; i < iplist.Length; ++i)
 						{
-							if (iplist[i].AddressFamily == AddressFamily.InterNetwork)
+							if (iplist[i].AddressFamily == AddressFamily.InterNetworkV6)
 							{
-								family = AddressFamily.InterNetwork;
+								family = AddressFamily.InterNetworkV6;
 								break;
 							}
 						}
@@ -625,7 +625,7 @@ namespace TinyNet
 				Interlocked.Decrement(ref workcount);
 				return;
 			}
-			new Thread(delegate()
+			new Thread(delegate ()
 			{
 				Thread.CurrentThread.Name = "Network Write";
 				while (running)
@@ -702,7 +702,7 @@ namespace TinyNet
 				{
 					manager.sockets.Add(this, true);
 				}
-				new Thread(delegate()
+				new Thread(delegate ()
 				{
 					Thread.CurrentThread.Name = "Network Read";
 					byte[] bytes = new byte[64 * 1024];
@@ -805,7 +805,10 @@ namespace TinyNet
 					Loop.Run(() =>
 					{
 						if (manager.settings.events.close != null)
+						{
 							manager.settings.events.close(this);
+							manager.settings.events.close = null;
+						}
 					});
 				}
 			}
@@ -945,7 +948,7 @@ namespace TinyNet
 						size = length - offset;
 						Request old = request;
 						request = manager.NewRequest();
-						Loop.Run(delegate()
+						Loop.Run(delegate ()
 						{
 							if (manager.settings.events.request != null)
 							{
@@ -961,7 +964,7 @@ namespace TinyNet
 					Socket.Close();
 					if (manager.settings.events.close != null)
 					{
-						Loop.Run(delegate()
+						Loop.Run(delegate ()
 						{
 							if (manager.settings.events.close != null)
 								manager.settings.events.close(this);
@@ -969,7 +972,7 @@ namespace TinyNet
 					}
 					if (manager.settings.events.exception != null)
 					{
-						Loop.Run(delegate()
+						Loop.Run(delegate ()
 						{
 							if (manager.settings.events.exception != null)
 								manager.settings.events.exception(this, e);
@@ -982,7 +985,7 @@ namespace TinyNet
 		protected abstract Request NewRequest();
 		protected abstract void ReleaseRequest(Request request);
 		#endregion
-		
+
 		#region 主循环调用
 		private static class Loop
 		{
