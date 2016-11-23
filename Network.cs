@@ -353,6 +353,7 @@ namespace TinyNet
 		private readonly Queue<NetHandlerImpl> workqueue = new Queue<NetHandlerImpl>();
 		private readonly Dictionary<NetHandlerImpl, bool> workindex = new Dictionary<NetHandlerImpl, bool>();
 		private readonly Dictionary<int, Control> listens = new Dictionary<int, Control>();
+		private readonly Dictionary<int, Control> listensv6 = new Dictionary<int, Control>();
 		private readonly Dictionary<NetHandlerImpl, bool> sockets = new Dictionary<NetHandlerImpl, bool>();
 
 		private static readonly Dictionary<NetManager, bool> managers = new Dictionary<NetManager, bool>();
@@ -383,7 +384,7 @@ namespace TinyNet
 		{
 			if (!running)
 				throw new ObjectDisposedException(ToString());
-			new Thread(delegate ()
+			new Thread(delegate()
 			{
 				Thread.CurrentThread.Name = "Network Server";
 				TcpListener server = new TcpListener(IPAddress.Any, port);
@@ -430,6 +431,53 @@ namespace TinyNet
 				}
 				server.Stop();
 			}).Start();
+			new Thread(delegate()
+			{
+				Thread.CurrentThread.Name = "Network Server";
+				TcpListener server = new TcpListener(IPAddress.IPv6Any, port);
+				server.Start();
+				Control ctrl;
+				lock (listensv6)
+				{
+					if (listensv6.TryGetValue(port, out ctrl))
+					{
+						ctrl.running = true;
+					}
+					else
+					{
+						ctrl = new Control { running = true };
+						listensv6[port] = ctrl;
+					}
+				}
+				ctrl.action = callback;
+				while (running)
+				{
+					if (!server.Server.Poll(1000, SelectMode.SelectRead))
+					{
+						if (!ctrl.running)
+							break;
+						continue;
+					}
+					if (!server.Pending())
+						break;
+					NetHandlerImpl socket = new NetHandlerImpl(server.AcceptSocket(), this);
+					socket.Socket.Blocking = false;
+					socket.OnConnected();
+					Loop.Run(() =>
+					{
+						ctrl.action(socket);
+					});
+				}
+				lock (listensv6)
+				{
+					Control ctrlnow;
+					if (listensv6.TryGetValue(port, out ctrlnow) && ctrlnow == ctrl)
+					{
+						listensv6.Remove(port);
+					}
+				}
+				server.Stop();
+			}).Start();
 		}
 
 		public void Stop(int port)
@@ -443,6 +491,15 @@ namespace TinyNet
 				{
 					ctrl.running = false;
 					listens.Remove(port);
+				}
+			}
+			lock (listensv6)
+			{
+				Control ctrl;
+				if (listensv6.TryGetValue(port, out ctrl))
+				{
+					ctrl.running = false;
+					listensv6.Remove(port);
 				}
 			}
 		}
@@ -625,7 +682,7 @@ namespace TinyNet
 				Interlocked.Decrement(ref workcount);
 				return;
 			}
-			new Thread(delegate ()
+			new Thread(delegate()
 			{
 				Thread.CurrentThread.Name = "Network Write";
 				while (running)
@@ -680,11 +737,13 @@ namespace TinyNet
 
 			public readonly ByteBuffer buffer = new ByteBuffer();
 			private readonly NetManager manager;
+			private int closed;
 			private Request request;
 
 			public NetHandlerImpl(AddressFamily family, NetManager manager)
 			{
 				this.manager = manager;
+				this.closed = 0;
 				Socket = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
 				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
@@ -692,6 +751,7 @@ namespace TinyNet
 			public NetHandlerImpl(Socket socket, NetManager manager)
 			{
 				this.manager = manager;
+				this.closed = 0;
 				Socket = socket;
 				Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(false, 0));
 			}
@@ -702,7 +762,7 @@ namespace TinyNet
 				{
 					manager.sockets.Add(this, true);
 				}
-				new Thread(delegate ()
+				new Thread(delegate()
 				{
 					Thread.CurrentThread.Name = "Network Read";
 					byte[] bytes = new byte[64 * 1024];
@@ -795,7 +855,8 @@ namespace TinyNet
 
 			public override void Close()
 			{
-				Socket.Close();
+				if (Interlocked.CompareExchange(ref closed, 1, 0) != 0)
+					return;
 				lock (manager.sockets)
 				{
 					manager.sockets.Remove(this);
@@ -805,11 +866,13 @@ namespace TinyNet
 					Loop.Run(() =>
 					{
 						if (manager.settings.events.close != null)
-						{
 							manager.settings.events.close(this);
-							manager.settings.events.close = null;
-						}
+						Socket.Close();
 					});
+				}
+				else
+				{
+					Socket.Close();
 				}
 			}
 
@@ -948,7 +1011,7 @@ namespace TinyNet
 						size = length - offset;
 						Request old = request;
 						request = manager.NewRequest();
-						Loop.Run(delegate ()
+						Loop.Run(delegate()
 						{
 							if (manager.settings.events.request != null)
 							{
@@ -961,18 +1024,22 @@ namespace TinyNet
 				}
 				catch (Exception e)
 				{
-					Socket.Close();
 					if (manager.settings.events.close != null)
 					{
-						Loop.Run(delegate ()
+						Loop.Run(delegate()
 						{
 							if (manager.settings.events.close != null)
 								manager.settings.events.close(this);
+							Socket.Close();
 						});
+					}
+					else
+					{
+						Socket.Close();
 					}
 					if (manager.settings.events.exception != null)
 					{
-						Loop.Run(delegate ()
+						Loop.Run(delegate()
 						{
 							if (manager.settings.events.exception != null)
 								manager.settings.events.exception(this, e);
@@ -985,7 +1052,7 @@ namespace TinyNet
 		protected abstract Request NewRequest();
 		protected abstract void ReleaseRequest(Request request);
 		#endregion
-
+		
 		#region 主循环调用
 		private static class Loop
 		{

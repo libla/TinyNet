@@ -31,7 +31,7 @@ namespace TinyNet
 								Debug.Log("handler close");
 							},
 							write = (handler, len) => {
-								Debug.Log("write " + len);;
+								Debug.Log("write " + len);
 							}
 						}
 					};
@@ -43,7 +43,7 @@ namespace TinyNet
 
 		public static void StartListen(int port)
 		{
-			NetMgr.Listen(port, delegate (NetHandler socket)
+			NetMgr.Listen(port, delegate(NetHandler socket)
 			{
 				Debug.Log("New Connection");
 			});
@@ -70,7 +70,7 @@ namespace TinyNet
 		{
 			NetManager.Initialize();
 			StartListen(12306);
-			StartConnect("127.0.0.1:12306");
+			StartConnect("localhost:12306");
 		}
 	}
 }
