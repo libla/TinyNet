@@ -218,7 +218,7 @@ namespace TinyNet
 			int len = length;
 			while (len > 0)
 			{
-				int l = PreTest(buffer, bytes, offset, length);
+				int l = PreTest(buffer, bytes, offset, len);
 				offset += l;
 				len -= l;
 				if (Test(buffer))
